@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-LiteVNA CLI: bezposredni pomiar S11, eksport Touchstone/CSV oraz wlasna
-1-portowa kalibracja SOL z dowolnym rezystorem LOAD.
+LiteVNA CLI: pomiar S11/S21, eksport Touchstone (S11)/CSV oraz wlasna
+1-portowa kalibracja SOL z dowolnym rezystorem LOAD i S21 THRU/ISOLATION.
+
+S21: calibrate-s21 --out s21.lvcal.json, potem
+     measure-s21 --cal s21.lvcal.json --out dut_s21.csv.
+Korekcja S21 jest programowa, nie zapisuje wspolczynnikow do LiteVNA.
 
 Wymagania:
     pip install pyserial
@@ -92,6 +96,7 @@ MODE_NORMAL = 2
 MODE_USB_CAL = 3
 
 CHANNEL_S11 = 1
+CHANNEL_S21 = 2
 FIFO_RECORD_SIZE = 32
 Z0_DEFAULT = 50.0
 
@@ -292,7 +297,10 @@ def parse_record(rec: bytes):
     return idx, complex(fwd_re, fwd_im), complex(rev0_re, rev0_im), complex(rev1_re, rev1_im)
 
 
-def acquire_s11_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mode: int):
+def acquire_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mode: int,
+                 channel: int = CHANNEL_S11):
+    if channel not in (CHANNEL_S11, CHANNEL_S21):
+        raise ValueError("Nieobslugiwany kanal")
     if points < 2 or points > 65535:
         raise ValueError("points musi byc 2..65535")
     if not (1 <= avg <= 80):
@@ -302,7 +310,7 @@ def acquire_s11_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mo
 
     resync(ser)
     write1(ser, REG_DATA_MODE, mode)
-    write1(ser, REG_CHANNEL_SELECT, CHANNEL_S11)
+    write1(ser, REG_CHANNEL_SELECT, channel)
     write1(ser, REG_AVERAGE, avg)
     write8(ser, REG_SWEEP_START, start_hz)
     write8(ser, REG_SWEEP_STEP, step_hz)
@@ -322,11 +330,11 @@ def acquire_s11_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mo
         n = min(255, max(1, points - len(by_index)))
         raw = request_fifo_records(ser, n)
         for off in range(0, len(raw), FIFO_RECORD_SIZE):
-            idx, fwd, rev0, _ = parse_record(raw[off:off + FIFO_RECORD_SIZE])
+            idx, fwd, rev0, rev1 = parse_record(raw[off:off + FIFO_RECORD_SIZE])
             records_seen += 1
             if idx >= points or abs(fwd) < 1e-30:
                 continue
-            by_index[idx] = rev0 / fwd
+            by_index[idx] = (rev0 if channel == CHANNEL_S11 else rev1) / fwd
 
     missing = [i for i in range(points) if i not in by_index]
     if missing:
@@ -335,6 +343,14 @@ def acquire_s11_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mo
         )
     freqs = [start_hz + i * step_hz for i in range(points)]
     return freqs, [by_index[i] for i in range(points)]
+
+
+def acquire_s11_grid(ser, start_hz, step_hz, points, avg, mode):
+    return acquire_grid(ser, start_hz, step_hz, points, avg, mode, CHANNEL_S11)
+
+
+def acquire_s21_grid(ser, start_hz, step_hz, points, avg, mode):
+    return acquire_grid(ser, start_hz, step_hz, points, avg, mode, CHANNEL_S21)
 
 
 def make_grid(start_hz: float, stop_hz: float, points: int):
@@ -701,9 +717,168 @@ def cmd_measure(args):
             ser.close()
 
 
+S21_CAL_FORMAT = "LiteVNA-Python-S21-response-v1"
+
+
+def validate_s21_grid(start, step, points, avg):
+    if not (2 <= points <= 65535 and 1 <= avg <= 80 and step >= 1 and start >= 1):
+        raise ValueError("Nieprawidlowa siatka: start/step >= 1, points 2..65535, avg 1..80")
+    if start + step * (points - 1) >= 2**64:
+        raise ValueError("Czestotliwosc poza zakresem protokolu")
+
+
+def finite_complex(value):
+    return math.isfinite(value.real) and math.isfinite(value.imag)
+
+
+def s21_tracking(thru, isolation):
+    if not thru or len(thru) != len(isolation):
+        raise ValueError("Niezgodne dlugosci THRU/ISOLATION")
+    tracking = []
+    for i, (t, iso) in enumerate(zip(thru, isolation)):
+        gain = t - iso
+        if not finite_complex(t) or not finite_complex(iso) or abs(gain) < 1e-12:
+            raise ValueError(f"Nieprawidlowa kalibracja S21 w punkcie {i}: brak sygnalu THRU")
+        tracking.append(gain)
+    return tracking
+
+
+def apply_s21(measured, thru, isolation):
+    tracking = s21_tracking(thru, isolation)
+    if len(measured) != len(tracking):
+        raise ValueError("Liczba punktow kalibracji S21 nie zgadza sie z pomiarem")
+    return [(m - iso) / gain for m, iso, gain in zip(measured, isolation, tracking)]
+
+
+def load_s21_cal(path):
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") != S21_CAL_FORMAT:
+        raise ValueError("Oczekiwano kalibracji z calibrate-s21 (kalibracja SOL S11 nie pasuje)")
+    grid = obj["grid"]
+    values = [grid[k] for k in ("start_hz", "step_hz", "points", "avg")]
+    if any(type(v) is not int for v in values):
+        raise ValueError("Siatka kalibracji S21 musi zawierac liczby calkowite")
+    validate_s21_grid(*values)
+    thru = [complex(*v) for v in obj["thru"]]
+    isolation = [complex(*v) for v in obj["isolation"]]
+    if len(thru) != grid["points"]:
+        raise ValueError("Liczba punktow THRU nie zgadza sie z siatka")
+    s21_tracking(thru, isolation)
+    return obj, thru, isolation
+
+
+def write_s21_csv(path, freqs, values, source):
+    # CSV preserves S21 explicitly; S1P would incorrectly label it as S11.
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["freq_Hz", "S21_re", "S21_im", "S21_logmag_dB",
+                         "S21_phase_deg", "S21_linmag", "insertion_loss_dB", "source"])
+        for freq, value in zip(freqs, values):
+            magnitude = abs(value)
+            db = 20 * math.log10(magnitude) if magnitude else -math.inf
+            writer.writerow([freq, value.real, value.imag, db,
+                             math.degrees(cmath.phase(value)), magnitude, -db, source])
+
+
+def close_s21_session(ser):
+    if ser is not None:
+        try:
+            resync(ser)
+            write1(ser, REG_CHANNEL_SELECT, 0)  # restore both channels for normal UI
+            write1(ser, REG_DATA_MODE, MODE_NORMAL)
+        finally:
+            ser.close()
+
+
+def cmd_calibrate_s21(args):
+    start, step, points = make_grid(args.start, args.stop, args.points)
+    validate_s21_grid(start, step, points, args.avg)
+    ser = None
+    try:
+        ser, port, info = connect(args.port)
+        print(f"Polaczono: {port}; S21 THRU, {start} .. {start + step*(points-1)} Hz")
+        print("Korekcja programowa w Pythonie; nie zapisuje kalibracji w LiteVNA.")
+        isolation = [0j] * points
+        if args.isolation:
+            input("ISOLATION: rozlacz tor; zakoncz oba konce kabli obciazeniami 50 ohm. Enter... ")
+            freqs, isolation = acquire_s21_grid(ser, start, step, points, args.avg, MODE_USB_UNCAL)
+        input("THRU: polacz konce kabli S11/CH0 i S21/CH1 zlaczem THRU zamiast DUT. Enter... ")
+        freqs, thru = acquire_s21_grid(ser, start, step, points, args.avg, MODE_USB_UNCAL)
+        s21_tracking(thru, isolation)
+        out = Path(args.out)
+        ensure_parent(out)
+        prefix = out.with_suffix("")
+        write_s21_csv(Path(str(prefix) + "_THRU_raw.csv"), freqs, thru, "raw THRU")
+        if args.isolation:
+            write_s21_csv(Path(str(prefix) + "_ISOLATION_raw.csv"), freqs, isolation, "raw ISOLATION")
+        obj = {
+            "format": S21_CAL_FORMAT,
+            "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "grid": {"start_hz": start, "step_hz": step, "points": points, "avg": args.avg},
+            "device": info,
+            "z0_ohm": 50.0,
+            "model": "ideal THRU S21=1; response correction, no mismatch correction",
+            "isolation_measured": args.isolation,
+            "thru": [[v.real, v.imag] for v in thru],
+            "isolation": [[v.real, v.imag] for v in isolation],
+        }
+        out.write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(f"Zapisano kalibracje S21: {out.resolve()}")
+    finally:
+        close_s21_session(ser)
+
+
+def cmd_measure_s21(args):
+    # Validate files and output before contacting hardware.
+    out = Path(args.out)
+    if out.suffix.lower() != ".csv":
+        raise ValueError("S21 wymaga --out plik.csv; S1P oznacza S11, a S12/S22 nie sa mierzone")
+    cal = load_s21_cal(Path(args.cal)) if args.cal else None
+    ser = None
+    try:
+        ser, port, info = connect(args.port)
+        if cal:
+            obj, thru, isolation = cal
+            grid = obj["grid"]
+            start, step, points = (grid[k] for k in ("start_hz", "step_hz", "points"))
+            avg = grid["avg"] if args.avg is None else args.avg
+            if args.current or any(v is not None for v in (args.start, args.stop, args.points)):
+                print("UWAGA: --cal narzuca siatke; --current/start/stop/points sa ignorowane.")
+            source = f"software S21 response: {args.cal}"
+            mode = MODE_USB_UNCAL
+        else:
+            if args.current:
+                start, step, points, avg = current_sweep(ser)
+            else:
+                start, step, points = make_grid(
+                    400_000 if args.start is None else args.start,
+                    2_000_000 if args.stop is None else args.stop,
+                    1024 if args.points is None else args.points)
+                avg = 2
+            if args.avg is not None:
+                avg = args.avg
+            mode = MODE_USB_UNCAL if args.raw else MODE_USB_CAL
+            source = "raw S21" if args.raw else "LiteVNA device calibration (mode 3)"
+        validate_s21_grid(start, step, points, avg)
+        print(f"Polaczono: {port}; {source}; {points} pkt, AVG={avg}")
+        freqs, values = acquire_s21_grid(ser, start, step, points, avg, mode)
+        if cal:
+            values = apply_s21(values, thru, isolation)
+        ensure_parent(out)
+        write_s21_csv(out, freqs, values, source)
+        print(f"Zapisano S21 CSV: {out.resolve()}")
+        if args.marker is not None:
+            i = nearest_index(freqs, args.marker)
+            value = values[i]
+            db = 20 * math.log10(abs(value)) if value else -math.inf
+            print(f"Marker: {freqs[i]} Hz; S21={value}; {db:.6g} dB; {math.degrees(cmath.phase(value)):.6g} deg")
+    finally:
+        close_s21_session(ser)
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="LiteVNA CLI: S11, custom SOL i eksport formatow pomiarowych"
+        description="LiteVNA CLI: S11 SOL, S21 THRU i eksport danych"
     )
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -738,6 +913,30 @@ def build_parser():
     p.add_argument("--format", default="rjx", help="np. rjx,logmag,series-l,series-c albo all")
     p.add_argument("--out", default="litevna_measurement.s1p")
     p.set_defaults(func=cmd_measure)
+    p = sub.add_parser("calibrate-s21", help="kalibracja transmisji THRU, opcjonalnie ISOLATION")
+    p.add_argument("--port")
+    p.add_argument("--start", type=parse_eng, default=400_000)
+    p.add_argument("--stop", type=parse_eng, default=2_000_000)
+    p.add_argument("--points", type=int, default=1024)
+    p.add_argument("--avg", type=int, default=2)
+    p.add_argument("--isolation", action="store_true", help="zmierz przesluch przed THRU")
+    p.add_argument("--out", default="litevna_s21.lvcal.json")
+    p.set_defaults(func=cmd_calibrate_s21)
+
+    p = sub.add_parser("measure-s21", help="pomiar transmisji S21 do CSV")
+    p.add_argument("--port")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--device-cal", action="store_true", help="kalibracja LiteVNA, domyslnie")
+    src.add_argument("--raw", action="store_true")
+    src.add_argument("--cal", help="plik z calibrate-s21")
+    p.add_argument("--current", action="store_true")
+    p.add_argument("--start", type=parse_eng)
+    p.add_argument("--stop", type=parse_eng)
+    p.add_argument("--points", type=int)
+    p.add_argument("--avg", type=int)
+    p.add_argument("--marker", type=parse_eng)
+    p.add_argument("--out", default="litevna_s21.csv")
+    p.set_defaults(func=cmd_measure_s21)
     return ap
 
 

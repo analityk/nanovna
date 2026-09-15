@@ -2,7 +2,7 @@
 
 Dwa małe skrypty do pracy z **LiteVNA bez pośrednictwa aplikacji PC**:
 
-- `litevna_cli.py` — bezpośrednia komunikacja z LiteVNA po USB/COM, pomiar S11, eksport Touchstone/CSV oraz własna 1-portowa kalibracja SOL z dowolnym rezystorem LOAD.
+- `litevna_cli.py` — bezpośrednia komunikacja z LiteVNA po USB/COM, pomiar S11/S21, eksport Touchstone (S11)/CSV, własna kalibracja SOL S11 oraz THRU/ISOLATION S21.
 - `litevna_plot.py` — niezależny plotter dla plików `.s1p` i `.csv`, z reprezentacjami podobnymi do tych dostępnych w LiteVNA: `R+jX`, `Series L`, `Series C`, `LOGMAG`, `phase`, `SWR`, Smith itd.
 
 Główny cel projektu to uzyskanie **powtarzalnego i audytowalnego toru pomiarowego**, niezależnego od tego, czy aplikacja PC poprawnie odczytuje lub stosuje kalibrację zapisaną w LiteVNA.
@@ -355,6 +355,151 @@ Z = 47.1888 -0.0264j ohm
 
 ---
 
+# Kalibracja i pomiar transmisji S21
+
+S21 opisuje transmisję od portu nadawczego **S11/CH0** do odbiorczego
+**S21/CH1**. Podłącz wejście DUT do S11, a wyjście do S21. Dotychczasowe
+`calibrate` i `measure` nadal dotyczą S11; nowe komendy to `calibrate-s21`
+i `measure-s21`.
+
+## Programowa kalibracja S21 przez USB
+
+Podłącz LiteVNA, włącz go i zamknij inne aplikacje używające COM.
+Sprawdź połączenie:
+
+```powershell
+py litevna_cli.py info --port COM3
+```
+
+Zostaw oba kable pomiarowe podłączone do analizatora. Kalibruj na ich
+końcach, w miejscach późniejszego podłączenia DUT:
+
+```powershell
+py litevna_cli.py calibrate-s21 --port COM3 --start 400k --stop 2M --points 1024 --avg 2 --out s21.lvcal.json
+```
+
+Na komunikat **THRU** połącz końce kabli odpowiednią przelotką, bez DUT,
+i naciśnij Enter. Skrypt wykona rzeczywisty sweep LiteVNA w trybie bez
+kalibracji użytkownika i zapisze wzorzec. Zakłada idealny THRU: S21 = 1,
+bez strat i opóźnienia. Straty i opóźnienie przelotki zostaną znormalizowane;
+przy wyższych częstotliwościach nieidealny THRU ogranicza dokładność.
+
+Opcjonalny pomiar przesłuchu przed THRU:
+
+```powershell
+py litevna_cli.py calibrate-s21 --port COM3 --start 400k --stop 2M --points 1024 --avg 8 --isolation --out s21_iso.lvcal.json
+```
+
+Na **ISOLATION** rozłącz tor i zakończ każdy kabel osobnym obciążeniem
+50 Ω. Porty nie mogą być połączone. Po Enter poczekaj na zakończenie sweepu,
+a następnie podłącz THRU zgodnie z następnym komunikatem. Nie używaj tutaj
+rezystora 23.75 Ω z przykładu SOL. Pomiar izolacji blisko poziomu szumu może
+pogorszyć wynik; używaj go, gdy potrzebujesz korekcji stabilnego przesłuchu.
+
+Powstaną:
+
+```text
+s21_iso.lvcal.json
+s21_iso.lvcal_THRU_raw.csv
+s21_iso.lvcal_ISOLATION_raw.csv
+```
+
+Bez `--isolation` nie powstaje plik ISOLATION, a przesłuch jest przyjmowany
+jako zero. Dla każdego punktu stosowana jest zespolona korekcja:
+
+```text
+S21_corrected = (S21_measured - S21_isolation) / (S21_thru - S21_isolation)
+```
+
+To kalibracja odpowiedzi transmisyjnej: koryguje amplitudę, fazę i opcjonalnie
+przesłuch. Nie jest pełną kalibracją dwuportową ani Enhanced Response;
+nie usuwa błędów niedopasowania źródła i obciążenia, nie mierzy S12/S22.
+Współczynniki są zapisane na komputerze, **nie w pamięci LiteVNA**.
+Własna SOL S11 pozostaje osobną kalibracją.
+
+## Pomiar i sprawdzenie wyniku
+
+Zastąp THRU badanym układem bez zmieniania kabli:
+
+```powershell
+py litevna_cli.py measure-s21 --port COM3 --cal s21.lvcal.json --marker 1M --out dut_s21.csv
+```
+
+Jeśli wykonałeś wariant z izolacją, użyj `--cal s21_iso.lvcal.json`.
+Siatka częstotliwości i domyślne AVG pochodzą z JSON. `--avg` może nadpisać
+uśrednianie; `--start`, `--stop`, `--points` i `--current` są przy `--cal`
+ignorowane z komunikatem. Skrypt odrzuci plik kalibracji SOL S11,
+niekompletne współczynniki i zerowy sygnał odniesienia THRU.
+
+Kontrola po kalibracji:
+
+1. Ponowny pomiar THRU powinien być bliski 0 dB i 0° — to kontrola spójności.
+2. Niezależnie zmierz znany tłumik, np. 10 dB: oczekuj S21 około −10 dB
+   w zakresie jego specyfikacji. To lepszy sprawdzian niż sam THRU.
+3. Po wymianie kabli, zmianie płaszczyzn pomiarowych lub zakresu wykonaj
+   nową kalibrację. Zachowaj surowe CSV standardów do porównania.
+
+CSV zawiera `freq_Hz`, `S21_re`, `S21_im`, `S21_logmag_dB`,
+`S21_phase_deg`, `S21_linmag`, `insertion_loss_dB` i `source`.
+Dodatnie insertion loss oznacza tłumienie; S21 w dB ma wtedy znak ujemny.
+Zero transmisji daje −inf dB, a faza w tym punkcie nie ma znaczenia fizycznego.
+CSV z zespolonym S21 jest tutaj zapisem źródłowym. Nie eksportujemy S21
+jako `.s1p` ani nie wypełniamy niezmierzonych S12/S22 zerami w `.s2p`.
+Obecny `litevna_plot.py` obsługuje wyłącznie S11; CSV S21 można analizować
+np. w arkuszu kalkulacyjnym (częstotliwość względem dB/fazy).
+
+Surowy pomiar kontrolny:
+
+```powershell
+py litevna_cli.py measure-s21 --port COM3 --raw --start 400k --stop 2M --points 1024 --out raw_s21.csv
+```
+
+## Kalibracja zapisana bezpośrednio w LiteVNA
+
+To alternatywa dla JSON. Procedura z instrukcji LiteVNA:
+
+1. Ustaw zakres sweepu i podłącz docelowe kable.
+2. Wybierz **CAL → RESET → CALIBRATE**.
+3. Na końcu kabla S11 wykonaj kolejno **OPEN**, **SHORT**, **LOAD**
+   (standard 50 Ω), czekając na zakończenie każdego kroku.
+4. Pozostaw LOAD na torze nadawczym i wykonaj **ISOLN**, bez połączenia
+   pomiędzy portami.
+5. Połącz końce obu kabli przelotką i wykonaj **THRU**.
+6. Wybierz **DONE** i zapisz do wybranego slotu kalibracji.
+7. Wybierz ślad S21 przez **DISPLAY → CHANNEL** i format **LOGMAG**.
+
+Nazwy menu mogą różnić się między wersjami firmware. Źródło:
+[LiteVNA User Guide, Calibration, s. 10–11](https://storage.eleshop.eu/files/LiteVNA_User-Guide.pdf).
+
+Podłącz DUT i pobierz dane z aktywną korekcją urządzenia:
+
+```powershell
+py litevna_cli.py measure-s21 --port COM3 --device-cal --current --marker 1M --out device_s21.csv
+```
+
+`--device-cal` (również tryb domyślny) żąda danych skorygowanych przez firmware;
+nie uruchamia sekwencji OPEN/SHORT/LOAD/ISOLN/THRU ani nie potwierdza, że
+aktywna kalibracja jest poprawna. Sprawdź ją na ekranie urządzenia.
+Nie łącz `--device-cal` z `--cal` lub `--raw`.
+
+## Protokół i zakres weryfikacji
+
+S21 korzysta z wyboru CH1: rejestr `0x44`, wartość `2`. Dane pochodzą
+z zespolonego ilorazu odbiornika transmisyjnego i sygnału odniesienia
+w 32-bajtowym rekordzie FIFO. Po zakończeniu lub przerwaniu nowych komend
+skrypt przywraca oba kanały i tryb normalny. Opis rozszerzeń firmware:
+[DiSlord — protokół V2/LiteVNA](https://github.com/NanoVNA-Saver/nanovna-saver/issues/768#issuecomment-2622817345).
+
+Nową obsługę S21 sprawdzono testami z symulowanym portem szeregowym;
+nie wykonano jeszcze testu na fizycznym LiteVNA. Historyczne wyniki SOL
+z sekcji Status dotyczą S11. Testy uruchomisz bez sprzętu:
+
+```powershell
+py -m unittest discover -s tests -v
+```
+
+---
+
 # 2. `litevna_plot.py`
 
 Plotter działa całkowicie offline. Nie komunikuje się z LiteVNA.
@@ -631,9 +776,9 @@ Przykład:
 
 Aktualna wersja:
 
-- obsługuje **S11 / 1-port**,
+- obsługuje **S11 / 1-port** i **S21 / transmisję w przód**,
 - nie implementuje pełnej kalibracji 2-portowej,
-- nie wykonuje pomiaru S21,
+- dla S21 stosuje korekcję THRU/ISOLATION bez korekcji niedopasowania,
 - własna SOL zakłada idealny OPEN/SHORT i czysto rezystancyjny LOAD,
 - plotter Smitha pokazuje trajektorię Gamma bez pełnej siatki impedancyjnej,
 - dokładność końcowa nadal zależy od jakości fixture, standardów kalibracyjnych i powtarzalności mechanicznego podłączenia.
@@ -669,6 +814,6 @@ W obu przypadkach wynik końcowy jest zapisywany jako zwykły `.s1p`, który mo�
 
 # Bezpieczeństwo danych pomiarowych
 
-Pliki `.s1p` są traktowane jako podstawowy zapis pomiaru.
+Pliki `.s1p` są traktowane jako podstawowy zapis pomiaru S11. Dla S21 podstawowym zapisem jest CSV z kolumnami `S21_re` i `S21_im`.
 
 CSV i wykresy można zawsze wygenerować ponownie z `.s1p`, dlatego nie ma potrzeby zmieniać formatu Touchstone ani przechowywać wyników wyłącznie w formacie konkretnej aplikacji GUI.
