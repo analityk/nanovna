@@ -3,7 +3,10 @@
 LiteVNA CLI: pomiar S11/S21, eksport Touchstone (S11)/CSV oraz wlasna
 1-portowa kalibracja SOL z dowolnym rezystorem LOAD i S21 THRU/ISOLATION.
 
-S21: calibrate-s21 --out s21.lvcal.json, potem
+S11/S21 Enhanced Response: calibrate-er --load 50 --out er.lvcal.json, potem
+     measure-s21 --cal er.lvcal.json --out dut_s21.csv.
+
+S21 response (bez SOL): calibrate-s21 --out s21.lvcal.json, potem
      measure-s21 --cal s21.lvcal.json --out dut_s21.csv.
 Korekcja S21 jest programowa, nie zapisuje wspolczynnikow do LiteVNA.
 
@@ -95,6 +98,7 @@ MODE_USB_UNCAL = 0
 MODE_NORMAL = 2
 MODE_USB_CAL = 3
 
+CHANNEL_BOTH = 0
 CHANNEL_S11 = 1
 CHANNEL_S21 = 2
 FIFO_RECORD_SIZE = 32
@@ -299,7 +303,7 @@ def parse_record(rec: bytes):
 
 def acquire_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mode: int,
                  channel: int = CHANNEL_S11):
-    if channel not in (CHANNEL_S11, CHANNEL_S21):
+    if channel not in (CHANNEL_BOTH, CHANNEL_S11, CHANNEL_S21):
         raise ValueError("Nieobslugiwany kanal")
     if points < 2 or points > 65535:
         raise ValueError("points musi byc 2..65535")
@@ -322,7 +326,7 @@ def acquire_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mode: 
     ser.reset_input_buffer()
     time.sleep(0.03)
 
-    by_index: dict[int, complex] = {}
+    by_index = {}
     max_records = points * 4
     records_seen = 0
 
@@ -334,7 +338,10 @@ def acquire_grid(ser, start_hz: int, step_hz: int, points: int, avg: int, mode: 
             records_seen += 1
             if idx >= points or abs(fwd) < 1e-30:
                 continue
-            by_index[idx] = (rev0 if channel == CHANNEL_S11 else rev1) / fwd
+            if channel == CHANNEL_BOTH:
+                by_index[idx] = (rev0 / fwd, rev1 / fwd)
+            else:
+                by_index[idx] = (rev0 if channel == CHANNEL_S11 else rev1) / fwd
 
     missing = [i for i in range(points) if i not in by_index]
     if missing:
@@ -351,6 +358,11 @@ def acquire_s11_grid(ser, start_hz, step_hz, points, avg, mode):
 
 def acquire_s21_grid(ser, start_hz, step_hz, points, avg, mode):
     return acquire_grid(ser, start_hz, step_hz, points, avg, mode, CHANNEL_S21)
+
+
+def acquire_s11_s21_grid(ser, start_hz, step_hz, points, avg, mode):
+    freqs, pairs = acquire_grid(ser, start_hz, step_hz, points, avg, mode, CHANNEL_BOTH)
+    return freqs, [v[0] for v in pairs], [v[1] for v in pairs]
 
 
 def make_grid(start_hz: float, stop_hz: float, points: int):
@@ -438,6 +450,9 @@ def save_cal(path: Path, *, start: int, step: int, points: int, avg: int, z0: fl
 
 def load_cal(path: Path):
     obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") == ER_CAL_FORMAT:
+        obj, _, _ = load_s21_cal(path)
+        return obj, decode_sol_coefficients(obj)
     if obj.get("format") != "LiteVNA-Python-SOL-1port-v1":
         raise ValueError("Nieznany format pliku kalibracji")
     coeffs = []
@@ -718,6 +733,7 @@ def cmd_measure(args):
 
 
 S21_CAL_FORMAT = "LiteVNA-Python-S21-response-v1"
+ER_CAL_FORMAT = "LiteVNA-Python-EnhancedResponse-v1"
 
 
 def validate_s21_grid(start, step, points, avg):
@@ -752,8 +768,8 @@ def apply_s21(measured, thru, isolation):
 
 def load_s21_cal(path):
     obj = json.loads(path.read_text(encoding="utf-8"))
-    if obj.get("format") != S21_CAL_FORMAT:
-        raise ValueError("Oczekiwano kalibracji z calibrate-s21 (kalibracja SOL S11 nie pasuje)")
+    if obj.get("format") not in (S21_CAL_FORMAT, ER_CAL_FORMAT):
+        raise ValueError("Oczekiwano kalibracji z calibrate-er lub calibrate-s21 (sama SOL S11 nie pasuje)")
     grid = obj["grid"]
     values = [grid[k] for k in ("start_hz", "step_hz", "points", "avg")]
     if any(type(v) is not int for v in values):
@@ -764,6 +780,12 @@ def load_s21_cal(path):
     if len(thru) != grid["points"]:
         raise ValueError("Liczba punktow THRU nie zgadza sie z siatka")
     s21_tracking(thru, isolation)
+    if obj["format"] == ER_CAL_FORMAT:
+        coeffs = decode_sol_coefficients(obj)
+        thru_s11 = [complex(*v) for v in obj["thru_s11"]]
+        er_tracking(thru, isolation, thru_s11, coeffs)
+        if obj.get("z0_ohm") != 50.0:
+            raise ValueError("Enhanced Response wymaga Z0=50 ohm")
     return obj, thru, isolation
 
 
@@ -844,7 +866,8 @@ def cmd_measure_s21(args):
             avg = grid["avg"] if args.avg is None else args.avg
             if args.current or any(v is not None for v in (args.start, args.stop, args.points)):
                 print("UWAGA: --cal narzuca siatke; --current/start/stop/points sa ignorowane.")
-            source = f"software S21 response: {args.cal}"
+            kind = "Enhanced Response" if obj["format"] == ER_CAL_FORMAT else "S21 response"
+            source = f"software {kind}: {args.cal}"
             mode = MODE_USB_UNCAL
         else:
             if args.current:
@@ -861,12 +884,23 @@ def cmd_measure_s21(args):
             source = "raw S21" if args.raw else "LiteVNA device calibration (mode 3)"
         validate_s21_grid(start, step, points, avg)
         print(f"Polaczono: {port}; {source}; {points} pkt, AVG={avg}")
-        freqs, values = acquire_s21_grid(ser, start, step, points, avg, mode)
-        if cal:
-            values = apply_s21(values, thru, isolation)
+        s11 = None
+        if cal and obj["format"] == ER_CAL_FORMAT:
+            freqs, raw_s11, raw_s21 = acquire_s11_s21_grid(ser, start, step, points, avg, mode)
+            coeffs = decode_sol_coefficients(obj)
+            thru_s11 = [complex(*v) for v in obj["thru_s11"]]
+            s11, values = apply_er(raw_s11, raw_s21, thru, isolation, thru_s11, coeffs)
+        else:
+            freqs, values = acquire_s21_grid(ser, start, step, points, avg, mode)
+            if cal:
+                values = apply_s21(values, thru, isolation)
         ensure_parent(out)
         write_s21_csv(out, freqs, values, source)
         print(f"Zapisano S21 CSV: {out.resolve()}")
+        if s11 is not None:
+            s11_path = out.with_name(out.stem + "_s11.s1p")
+            write_s1p(s11_path, freqs, s11, "SOL S11 from Enhanced Response acquisition", 50.0)
+            print(f"Zapisano S11 z tego samego sweepu: {s11_path.resolve()}")
         if args.marker is not None:
             i = nearest_index(freqs, args.marker)
             value = values[i]
@@ -876,9 +910,113 @@ def cmd_measure_s21(args):
         close_s21_session(ser)
 
 
+def decode_sol_coefficients(obj):
+    rows = obj["coefficients"]
+    if len(rows) != obj["grid"]["points"] or any(len(row) != 6 for row in rows):
+        raise ValueError("Nieprawidlowa liczba wspolczynnikow SOL")
+    coeffs = [(complex(r[0], r[1]), complex(r[2], r[3]), complex(r[4], r[5])) for r in rows]
+    for A, B, C in coeffs:
+        if not all(finite_complex(v) for v in (A, B, C)) or abs(B + A*C) < 1e-12:
+            raise ValueError("Osobliwa lub niefinitywna kalibracja SOL")
+    return coeffs
+
+
+def er_source_factors(raw_s11, coeffs):
+    if len(raw_s11) != len(coeffs):
+        raise ValueError("Liczba punktow S11 nie zgadza sie z SOL")
+    corrected, factors = [], []
+    for i, (m, (A, B, C)) in enumerate(zip(raw_s11, coeffs)):
+        g = apply_sol_point(m, A, B, C)
+        factor = 1 - C*g
+        if not finite_complex(g) or not finite_complex(factor) or abs(factor) < 1e-12:
+            raise ValueError(f"Osobliwa korekcja Enhanced Response w punkcie {i}")
+        corrected.append(g)
+        factors.append(factor)
+    return corrected, factors
+
+
+def er_tracking(thru, isolation, thru_s11, coeffs):
+    # C is source match in m11=(A+B*g)/(1-C*g).
+    # With ideal THRU, SOL-corrected reflection is the receiver load match.
+    # Account for its interaction with source match during THRU acquisition.
+    _, factors = er_source_factors(thru_s11, coeffs)
+    gains = s21_tracking(thru, isolation)
+    if len(gains) != len(factors):
+        raise ValueError("Niezgodne siatki THRU i SOL")
+    tracking = [gain * factor for gain, factor in zip(gains, factors)]
+    if any(not finite_complex(v) or abs(v) < 1e-12 for v in tracking):
+        raise ValueError("Osobliwy tracking Enhanced Response")
+    return tracking
+
+
+def apply_er(raw_s11, raw_s21, thru, isolation, thru_s11, coeffs):
+    tracking = er_tracking(thru, isolation, thru_s11, coeffs)
+    s11, factors = er_source_factors(raw_s11, coeffs)
+    if len(raw_s21) != len(tracking):
+        raise ValueError("Liczba punktow S21 nie zgadza sie z kalibracja")
+    s21 = [(m - iso)*factor/gain
+           for m, iso, factor, gain in zip(raw_s21, isolation, factors, tracking)]
+    if any(not finite_complex(v) for v in s21):
+        raise ValueError("Niefinitywny wynik S21")
+    return s11, s21
+
+
+def cmd_calibrate_er(args):
+    start, step, points = make_grid(args.start, args.stop, args.points)
+    validate_s21_grid(start, step, points, args.avg)
+    if not math.isfinite(args.load) or args.load <= 0:
+        raise ValueError("LOAD musi byc skonczona, dodatnia rezystancja")
+    gamma_load = z_to_gamma(complex(args.load), 50.0)
+    ser = None
+    try:
+        ser, port, info = connect(args.port)
+        print(f"Polaczono: {port}; Enhanced Response SOL + THRU; {points} pkt, AVG={args.avg}")
+        print("Kalibracja programowa Z0=50 ohm; zapis JSON, bez zapisu do LiteVNA.")
+        standards = {}
+        for name in ("OPEN", "SHORT", "LOAD"):
+            detail = f" {args.load:g} ohm" if name == "LOAD" else ""
+            input(f"Podlacz {name}{detail} na koncu kabla S11/CH0. Enter... ")
+            freqs, standards[name] = acquire_s11_grid(ser, start, step, points, args.avg, MODE_USB_UNCAL)
+        coeffs = [fit_sol_point(o, s, l, gamma_load)
+                  for o, s, l in zip(standards["OPEN"], standards["SHORT"], standards["LOAD"])]
+        isolation = [0j] * points
+        if args.isolation:
+            input("ISOLATION: rozlacz tor; zakoncz oba kable osobnymi obciazeniami 50 ohm. Enter... ")
+            freqs, isolation = acquire_s21_grid(ser, start, step, points, args.avg, MODE_USB_UNCAL)
+        input("THRU: polacz konce kabli S11/CH0 i S21/CH1 przelotka zamiast DUT. Enter... ")
+        freqs, thru_s11, thru = acquire_s11_s21_grid(ser, start, step, points, args.avg, MODE_USB_UNCAL)
+        obj = {
+            "format": ER_CAL_FORMAT,
+            "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "grid": {"start_hz": start, "step_hz": step, "points": points, "avg": args.avg},
+            "device": info, "z0_ohm": 50.0, "load_r_ohm": args.load,
+            "model": "SOL + ideal THRU; source-match corrected S21; residual DUT load-match error",
+            "isolation_measured": args.isolation,
+            "coefficients": [[A.real, A.imag, B.real, B.imag, C.real, C.imag] for A, B, C in coeffs],
+            "thru_s11": [[v.real, v.imag] for v in thru_s11],
+            "thru": [[v.real, v.imag] for v in thru],
+            "isolation": [[v.real, v.imag] for v in isolation],
+        }
+        decode_sol_coefficients(obj)
+        er_tracking(thru, isolation, thru_s11, coeffs)
+        out = Path(args.out)
+        ensure_parent(out)
+        prefix = str(out.with_suffix(""))
+        for name, values in standards.items():
+            write_s1p(Path(prefix + f"_{name}_raw.s1p"), freqs, values, "raw SOL standard", 50.0)
+        write_s1p(Path(prefix + "_THRU_S11_raw.s1p"), freqs, thru_s11, "raw THRU S11", 50.0)
+        write_s21_csv(Path(prefix + "_THRU_raw.csv"), freqs, thru, "raw THRU S21")
+        if args.isolation:
+            write_s21_csv(Path(prefix + "_ISOLATION_raw.csv"), freqs, isolation, "raw ISOLATION")
+        out.write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(f"Zapisano wspolna kalibracje S11/S21: {out.resolve()}")
+    finally:
+        close_s21_session(ser)
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="LiteVNA CLI: S11 SOL, S21 THRU i eksport danych"
+        description="LiteVNA CLI: S11 SOL, S21 Enhanced Response/THRU i eksport danych"
     )
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -928,7 +1066,7 @@ def build_parser():
     src = p.add_mutually_exclusive_group()
     src.add_argument("--device-cal", action="store_true", help="kalibracja LiteVNA, domyslnie")
     src.add_argument("--raw", action="store_true")
-    src.add_argument("--cal", help="plik z calibrate-s21")
+    src.add_argument("--cal", help="plik z calibrate-er lub calibrate-s21")
     p.add_argument("--current", action="store_true")
     p.add_argument("--start", type=parse_eng)
     p.add_argument("--stop", type=parse_eng)
@@ -937,6 +1075,16 @@ def build_parser():
     p.add_argument("--marker", type=parse_eng)
     p.add_argument("--out", default="litevna_s21.csv")
     p.set_defaults(func=cmd_measure_s21)
+    p = sub.add_parser("calibrate-er", help="wspolna kalibracja S11/S21 Enhanced Response: SOL + THRU")
+    p.add_argument("--port")
+    p.add_argument("--start", type=parse_eng, default=400_000)
+    p.add_argument("--stop", type=parse_eng, default=2_000_000)
+    p.add_argument("--points", type=int, default=1024)
+    p.add_argument("--avg", type=int, default=2)
+    p.add_argument("--load", type=float, default=50.0, help="rezystancja LOAD SOL, domyslnie 50 ohm")
+    p.add_argument("--isolation", action="store_true")
+    p.add_argument("--out", default="litevna_er.lvcal.json")
+    p.set_defaults(func=cmd_calibrate_er)
     return ap
 
 

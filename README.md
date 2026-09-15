@@ -2,7 +2,7 @@
 
 Dwa małe skrypty do pracy z **LiteVNA bez pośrednictwa aplikacji PC**:
 
-- `litevna_cli.py` — bezpośrednia komunikacja z LiteVNA po USB/COM, pomiar S11/S21, eksport Touchstone (S11)/CSV, własna kalibracja SOL S11 oraz THRU/ISOLATION S21.
+- `litevna_cli.py` — bezpośrednia komunikacja z LiteVNA po USB/COM, pomiar S11/S21, eksport Touchstone (S11)/CSV, własna kalibracja SOL S11, wspólna Enhanced Response S11/S21 oraz prosta THRU/ISOLATION S21.
 - `litevna_plot.py` — niezależny plotter dla plików `.s1p` i `.csv`, z reprezentacjami podobnymi do tych dostępnych w LiteVNA: `R+jX`, `Series L`, `Series C`, `LOGMAG`, `phase`, `SWR`, Smith itd.
 
 Główny cel projektu to uzyskanie **powtarzalnego i audytowalnego toru pomiarowego**, niezależnego od tego, czy aplikacja PC poprawnie odczytuje lub stosuje kalibrację zapisaną w LiteVNA.
@@ -360,9 +360,112 @@ Z = 47.1888 -0.0264j ohm
 S21 opisuje transmisję od portu nadawczego **S11/CH0** do odbiorczego
 **S21/CH1**. Podłącz wejście DUT do S11, a wyjście do S21. Dotychczasowe
 `calibrate` i `measure` nadal dotyczą S11; nowe komendy to `calibrate-s21`
-i `measure-s21`.
+i `measure-s21`; wspólną kalibrację SOL + THRU wykonuje `calibrate-er`.
 
-## Programowa kalibracja S21 przez USB
+## Zalecana wspólna kalibracja S11/S21: Enhanced Response
+
+Ta procedura łączy **SOL + THRU** w jednym pliku. Korekcja transmisji
+korzysta z niedopasowania źródła wyznaczonego podczas SOL oraz z S11
+mierzonego razem z S21. Wcześniejsza komenda `calibrate-s21` pozostaje
+prostą normalizacją THRU, bez tej korekcji.
+
+Dla LOAD 50 Ω i zakresu 400 kHz–2 MHz:
+
+```powershell
+py litevna_cli.py calibrate-er --port COM3 --start 400k --stop 2M --points 1024 --avg 8 --load 50 --isolation --out er_50ohm.lvcal.json
+```
+
+Zamień COM3 na swój port. Pozostaw docelowe kable podłączone do urządzenia
+przez całą kalibrację i pomiar. Na ich końcach wykonaj kolejno:
+
+1. **OPEN:** rozwarcie na końcu kabla S11/CH0, Enter.
+2. **SHORT:** zwarcie w tym samym miejscu, Enter.
+3. **LOAD:** wzorzec 50 Ω w tym samym miejscu, Enter.
+4. **ISOLATION:** oba końce kabli zakończ osobnymi obciążeniami 50 Ω,
+   bez połączenia między portami, Enter.
+5. **THRU:** usuń obciążenia i połącz końce kabli przelotką, Enter.
+
+Zawsze poczekaj na następny komunikat przed zmianą połączeń. `--isolation`
+można pominąć; wtedy przesłuch jest przyjmowany jako zero. Opcja `--load`
+opisuje rezystancję wzorca SOL (domyślnie 50 Ω); impedancja odniesienia
+Enhanced Response pozostaje 50 Ω. OPEN/SHORT oraz THRU są modelowane jako
+idealne. Używaj wzorców odpowiednich dla częstotliwości pomiaru — zwykły
+rezystor z długimi wyprowadzeniami nie jest idealnym obciążeniem RF.
+
+Po kalibracji zastąp THRU badanym układem:
+
+```powershell
+py litevna_cli.py measure-s21 --port COM3 --cal er_50ohm.lvcal.json --marker 1M --out dut_s21.csv
+```
+
+Program rozpoznaje Enhanced Response po formacie JSON i pobiera oba kanały
+z tych samych rekordów FIFO. Zapisuje:
+
+- `dut_s21.csv` — skorygowane zespolone S21, amplitudę w dB i fazę;
+- `dut_s21_s11.s1p` — S11 skorygowane metodą SOL z tego samego sweepu.
+
+Ten sam plik kalibracji można wykorzystać do samego S11:
+
+```powershell
+py litevna_cli.py measure --port COM3 --cal er_50ohm.lvcal.json --format rjx,logmag --out dut_s11.s1p
+```
+
+Obie komendy używają siatki z kalibracji; `--avg` może nadpisać jej
+uśrednianie. Nie łącz `--cal` z `--device-cal` ani `--raw`.
+Kalibracja jest wykonywana w Pythonie i nie zapisuje współczynników
+do pamięci analizatora. **Stare pliki SOL i THRU nadal działają w swoich
+trybach, ale nie stają się automatycznie Enhanced Response.** Wykonaj
+`calibrate-er` od początku: wymagany jest także surowy pomiar S11 wzorca THRU.
+
+Do audytu pozostają pliki:
+
+```text
+er_50ohm.lvcal.json
+er_50ohm.lvcal_OPEN_raw.s1p
+er_50ohm.lvcal_SHORT_raw.s1p
+er_50ohm.lvcal_LOAD_raw.s1p
+er_50ohm.lvcal_THRU_S11_raw.s1p
+er_50ohm.lvcal_THRU_raw.csv
+er_50ohm.lvcal_ISOLATION_raw.csv  (tylko z --isolation)
+```
+
+### Co jest korygowane
+
+Dla każdego punktu częstotliwości SOL wyznacza współczynniki A, B, C:
+
+```text
+m11 = (A + B * Gamma) / (1 - C * Gamma)
+Gamma = (m11 - A) / (B + C * m11)
+```
+
+C opisuje niedopasowanie źródła. Najpierw wyznaczamy Gamma_thru z surowego
+S11 wzorca THRU, a następnie tracking transmisji i wynik DUT:
+
+```text
+Et = (m21_thru - isolation) * (1 - C * Gamma_thru)
+S21_ER = (m21_dut - isolation) * (1 - C * Gamma_dut) / Et
+```
+
+Dzięki pomiarowi S11 THRU wyznaczanie Et uwzględnia interakcję źródła
+z niedopasowanym odbiornikiem. Dla idealnego THRU Gamma_thru odpowiada
+niedopasowaniu odbiornika widzianemu w płaszczyźnie kalibracji.
+
+**Enhanced Response nadal jest korekcją częściową jednego kierunku.**
+Usuwa wpływ niedopasowania źródła na transmisję, ale nie usuwa całego
+wpływu obciążenia DUT przez odbiornik. Przy niedopasowanym wyjściu DUT
+pozostaje błąd zależny od S22 i dopasowania odbiornika; również S11 układu
+transmisyjnego może zawierać wpływ obciążenia wyjścia. Program nie mierzy
+S12/S22 i nie deklaruje pełnej korekcji 12-składnikowej. Rozróżnienie
+Enhanced Response i pełnej korekcji przy pomiarze w dwóch orientacjach
+opisuje [scikit-rf: TwoPortOnePath / EnhancedResponse](https://github.com/scikit-rf/scikit-rf/blob/master/skrf/calibration/calibration.py).
+
+Po kalibracji sprawdź THRU (S21 blisko 0 dB i 0°), a następnie niezależny
+znany tłumik. Po zmianie kabli lub zakresu wykonaj nową kalibrację.
+Testy syntetyczne obejmują zespolony model błędów VNA, niedopasowanie
+źródła i odbiornika oraz przewidywany błąd resztkowy. Nie zastępują
+weryfikacji na fizycznym LiteVNA — ta pozostaje do wykonania.
+
+## Prosta kalibracja S21 przez USB — THRU bez SOL
 
 Podłącz LiteVNA, włącz go i zamknij inne aplikacje używające COM.
 Sprawdź połączenie:
@@ -490,7 +593,7 @@ w 32-bajtowym rekordzie FIFO. Po zakończeniu lub przerwaniu nowych komend
 skrypt przywraca oba kanały i tryb normalny. Opis rozszerzeń firmware:
 [DiSlord — protokół V2/LiteVNA](https://github.com/NanoVNA-Saver/nanovna-saver/issues/768#issuecomment-2622817345).
 
-Nową obsługę S21 sprawdzono testami z symulowanym portem szeregowym;
+Obsługę S21 i Enhanced Response sprawdzono testami z symulowanym portem szeregowym i modelem błędów VNA;
 nie wykonano jeszcze testu na fizycznym LiteVNA. Historyczne wyniki SOL
 z sekcji Status dotyczą S11. Testy uruchomisz bez sprzętu:
 
@@ -778,7 +881,8 @@ Aktualna wersja:
 
 - obsługuje **S11 / 1-port** i **S21 / transmisję w przód**,
 - nie implementuje pełnej kalibracji 2-portowej,
-- dla S21 stosuje korekcję THRU/ISOLATION bez korekcji niedopasowania,
+- dla S21 oferuje Enhanced Response z korekcją niedopasowania źródła oraz prostą THRU/ISOLATION,
+- Enhanced Response nie usuwa wszystkich błędów niedopasowania odbiornika i nie mierzy S12/S22,
 - własna SOL zakłada idealny OPEN/SHORT i czysto rezystancyjny LOAD,
 - plotter Smitha pokazuje trajektorię Gamma bez pełnej siatki impedancyjnej,
 - dokładność końcowa nadal zależy od jakości fixture, standardów kalibracyjnych i powtarzalności mechanicznego podłączenia.
