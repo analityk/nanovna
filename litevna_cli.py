@@ -34,9 +34,12 @@ Najwazniejsze tryby:
     python litevna_cli.py measure --port COM7 --raw \
         --start 400k --stop 2M --points 1024 --out raw.s1p
 
-5) Uzycie aktualnego zakresu ustawionego na ekranie LiteVNA:
-    python litevna_cli.py measure --port COM7 --device-cal --current \
+5) Pomiar z przywolana w urzadzeniu kalibracja CAL -> RECALL:
+    python litevna_cli.py measure --port COM7 --device-cal \
+        --start 400k --stop 2M --points 1001 --avg 2 \
         --format all --out current.s1p
+   Podaj zakres i liczbe punktow DOKLADNIE takie jak na ekranie.
+   Protokol USB nie pozwala odczytac ustawien sweepu CAL -> RECALL.
 
 Uwagi:
 - Format wyswietlania LiteVNA (LOGMAG, SERIES L, C itd.) NIE zmienia danych RF.
@@ -602,7 +605,7 @@ def cmd_info(args):
         start, step, points, avg = current_sweep(ser)
         print(f"Port: {port_name}")
         print(f"Device: variant=0x{info['variant']:02X}, protocol={info['protocol']}, HW={info['hw']}, FW={info['fw_major']}.{info['fw_minor']}")
-        print(f"Current sweep: start={start} Hz, step={step} Hz, points={points}, stop={start + step*(points-1)} Hz, avg={avg}")
+        print(f"USB sweep registers (NOT on-screen CAL -> RECALL): start={start} Hz, step={step} Hz, points={points}, stop={start + step*(points-1)} Hz, avg={avg}")
     finally:
         if ser:
             ser.close()
@@ -664,7 +667,26 @@ def cmd_calibrate(args):
             ser.close()
 
 
+def validate_device_cal_grid(args):
+    """Mode 3 uses firmware calibration, but USB cannot read the UI's recalled sweep."""
+    if args.raw or args.cal:
+        return
+    if args.current:
+        raise ValueError(
+            "--current odczytuje rejestry sweepu USB, a nie zakres CAL -> RECALL "
+            "ustawiony na ekranie LiteVNA. Dla --device-cal podaj jawnie "
+            "--start, --stop i --points zgodne z przywolana kalibracja."
+        )
+    if any(value is None for value in (args.start, args.stop, args.points)):
+        raise ValueError(
+            "Pomiar z kalibracja LiteVNA (domyslny --device-cal) wymaga "
+            "--start, --stop i --points zgodnych z aktywnym CAL -> RECALL. "
+            "Firmware nie udostepnia tych ustawien ekranu przez rejestry USB."
+        )
+
+
 def cmd_measure(args):
+    validate_device_cal_grid(args)
     ser = None
     try:
         ser, port_name, info = connect(args.port)
@@ -855,6 +877,7 @@ def cmd_measure_s21(args):
     out = Path(args.out)
     if out.suffix.lower() != ".csv":
         raise ValueError("S21 wymaga --out plik.csv; S1P oznacza S11, a S12/S22 nie sa mierzone")
+    validate_device_cal_grid(args)
     cal = load_s21_cal(Path(args.cal)) if args.cal else None
     ser = None
     try:
@@ -1041,7 +1064,7 @@ def build_parser():
     src.add_argument("--device-cal", action="store_true", help="uzyj kalibracji aktywnej w LiteVNA (domyslne)")
     src.add_argument("--raw", action="store_true", help="bez korekcji")
     src.add_argument("--cal", help="plik *.lvcal.json z komendy calibrate")
-    p.add_argument("--current", action="store_true", help="uzyj aktualnego zakresu/points ustawionych na ekranie LiteVNA")
+    p.add_argument("--current", action="store_true", help="odczytaj rejestry USB sweepu (nie zakres z ekranu); tylko --raw")
     p.add_argument("--start", type=parse_eng)
     p.add_argument("--stop", type=parse_eng)
     p.add_argument("--points", type=int)
@@ -1067,7 +1090,7 @@ def build_parser():
     src.add_argument("--device-cal", action="store_true", help="kalibracja LiteVNA, domyslnie")
     src.add_argument("--raw", action="store_true")
     src.add_argument("--cal", help="plik z calibrate-er lub calibrate-s21")
-    p.add_argument("--current", action="store_true")
+    p.add_argument("--current", action="store_true", help="rejestry USB sweepu (nie zakres z ekranu); tylko --raw")
     p.add_argument("--start", type=parse_eng)
     p.add_argument("--stop", type=parse_eng)
     p.add_argument("--points", type=int)
