@@ -146,12 +146,32 @@ class S21Tests(unittest.TestCase):
             self.assertTrue(ser.closed)
             self.assertEqual(ser.writes[-2:], [b'\x20\x44\x00', b'\x20\x26\x02'])
 
-    def test_device_cal_current(self):
+    def test_device_cal_requires_explicit_ui_grid(self):
+        parser = cli.build_parser()
+        for command, runner in [('measure', cli.cmd_measure), ('measure-s21', cli.cmd_measure_s21)]:
+            for suffix in [[], ['--device-cal', '--current'], ['--start', '1M', '--stop', '2M']]:
+                with self.subTest(command=command, suffix=suffix):
+                    args = parser.parse_args([command] + suffix)
+                    with patch.object(cli, 'connect') as connect, self.assertRaisesRegex(ValueError, '--start'):
+                        runner(args)
+                    connect.assert_not_called()
+
+    def test_device_cal_default_for_both_measurements(self):
+        parser = cli.build_parser()
         with tempfile.TemporaryDirectory() as tmp:
-            args = cli.build_parser().parse_args(['measure-s21', '--device-cal', '--current', '--out', str(Path(tmp)/'out.csv')])
-            with patch.object(cli, 'connect', return_value=(FakeSerial(), 'FAKE', {})), patch.object(cli, 'current_sweep', return_value=(100, 10, 2, 4)), patch.object(cli, 'acquire_s21_grid', return_value=([100, 110], [1, 1])) as acquire, patch.object(cli.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
-                cli.cmd_measure_s21(args)
-            self.assertEqual(acquire.call_args.args[1:], (100, 10, 2, 4, cli.MODE_USB_CAL))
+            grid = ['--start', '1M', '--stop', '2M', '--points', '2']
+            s11_args = parser.parse_args(['measure'] + grid + ['--out', str(Path(tmp)/'s11.s1p')])
+            with patch.object(cli, 'connect', return_value=(FakeSerial(), 'FAKE', {})), \
+                 patch.object(cli, 'acquire_s11_grid', return_value=([1000000, 2000000], [0j, 0j])) as acquire, \
+                 patch.object(cli.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_measure(s11_args)
+            self.assertEqual(acquire.call_args.args[1:], (1000000, 1000000, 2, 2, cli.MODE_USB_CAL))
+            s21_args = parser.parse_args(['measure-s21'] + grid + ['--out', str(Path(tmp)/'s21.csv')])
+            with patch.object(cli, 'connect', return_value=(FakeSerial(), 'FAKE', {})), \
+                 patch.object(cli, 'acquire_s21_grid', return_value=([1000000, 2000000], [1, 1])) as acquire, \
+                 patch.object(cli.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_measure_s21(s21_args)
+            self.assertEqual(acquire.call_args.args[1:], (1000000, 1000000, 2, 2, cli.MODE_USB_CAL))
 
     def test_s1p_output_rejected_before_connection(self):
         args = cli.build_parser().parse_args(['measure-s21', '--out', 'wrong.s1p'])

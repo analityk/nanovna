@@ -232,20 +232,43 @@ Jeżeli nie podano `--raw` ani `--cal`, kalibracja urządzenia jest również do
 
 ---
 
-## Użycie aktualnego sweepu ustawionego na ekranie LiteVNA
+## Kalibracja przywołana na ekranie: ważne ograniczenie USB
+
+Po wykonaniu **CAL → RECALL** ustawienia przywołanej kalibracji pozostają
+w urządzeniu. Aby pobrać dane skorygowane przez firmware (rejestr `0x26 = 3`),
+podaj **jawnie** zakres i liczbę punktów odpowiadające tej kalibracji:
 
 ```powershell
-py litevna_cli.py measure --port COM3 --device-cal --current --format all --out current.s1p
+py litevna_cli.py measure --port COM3 --device-cal --start 400k --stop 2M --points 1001 --avg 2 --format all --out current.s1p
 ```
 
-Skrypt odczyta z urządzenia:
+**Uwaga:** 400 kHz–2 MHz i 1001 punktów to jedynie przykład. Zastąp je
+wartościami ze swojego ekranu LiteVNA po CAL → RECALL. Skrypt ustawia
+własny sweep USB; przy innym zakresie firmware może interpolować
+współczynniki kalibracji. Nie da się zagwarantować jej dokładności,
+jeśli zmienisz zakres lub adaptery po kalibracji.
 
-- start,
-- step,
-- liczbę punktów,
-- aktualne averaging.
+Przełącznik `--current` **nie** odczytuje aktualnego sweepu z ekranu:
+odczytuje rejestry USB, które mogą zawierać ostatnią konfigurację hosta.
+Zgodnie z opisem protokołu LiteVNA nie można za ich pomocą odczytać
+parametrów przywołanych w UI. Dlatego `--current` działa wyłącznie
+dla `--raw`; przy kalibracji urządzenia komenda zwróci błąd zamiast
+zapisywać dane z nieznaną siatką.
 
-To jest wygodne, jeśli sweep został już ustawiony ręcznie na ekranie LiteVNA.
+Również pomiar `measure` lub `measure-s21` bez `--raw` i bez
+`--cal` korzysta z wewnętrznej kalibracji i wymaga kompletu
+`--start`, `--stop`, `--points`. Skrypt nie wywołuje ponownie
+OPEN/SHORT/LOAD/THRU i nie potrafi zweryfikować, czy korekcja na
+urządzeniu jest włączona.
+
+Źródło: [LiteVNA User Guide, USB data interface, s. 27–28](https://nanovna.com/wp-content/uploads/2021/11/LiteVNA_User-Guide.pdf).
+
+Do odczytu **rejestrów USB** (nie ustawień ekranu) nadal służy:
+
+```powershell
+py litevna_cli.py info --port COM3
+py litevna_cli.py measure --port COM3 --raw --current --out usb_grid_raw.s1p
+```
 
 ---
 
@@ -577,13 +600,15 @@ Nazwy menu mogą różnić się między wersjami firmware. Źródło:
 Podłącz DUT i pobierz dane z aktywną korekcją urządzenia:
 
 ```powershell
-py litevna_cli.py measure-s21 --port COM3 --device-cal --current --marker 1M --out device_s21.csv
+py litevna_cli.py measure-s21 --port COM3 --device-cal --start 400k --stop 2M --points 1001 --avg 2 --marker 1M --out device_s21.csv
 ```
 
 `--device-cal` (również tryb domyślny) żąda danych skorygowanych przez firmware;
 nie uruchamia sekwencji OPEN/SHORT/LOAD/ISOLN/THRU ani nie potwierdza, że
-aktywna kalibracja jest poprawna. Sprawdź ją na ekranie urządzenia.
-Nie łącz `--device-cal` z `--cal` lub `--raw`.
+aktywna kalibracja jest poprawna. Podaj zakres i punkty zgodne
+z **CAL → RECALL** na ekranie urządzenia (przykład powyżej należy
+dopasować do przywołanego zakresu). Nie łącz `--device-cal` z
+`--cal` lub `--raw`.
 
 ## Protokół i zakres weryfikacji
 
